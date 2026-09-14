@@ -1,0 +1,8 @@
+SpeechRecognition
+sounddevice
+numpy
+pyttsx3
+openai
+requests
+pywhatkit
+psutil
