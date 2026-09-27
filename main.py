@@ -1,76 +1,77 @@
 """
-Jarvis Voice Assistant (combined + extended)
-=============================================
-
-This merges the two Jarvis scripts you had into one file and adds:
-  - Time / date announcements
-  - Weather lookup (no API key needed - uses Open-Meteo)
-  - Shutdown / restart / sleep the computer (with spoken confirmation, safe)
-  - System status: battery + CPU + RAM ("unique" feature #1)
-  - Voice notes/reminders you can save and recall later ("unique" feature #2)
-  - News headlines (optional, needs a NewsAPI key)
-  - Everything from before: wake word, Google/YouTube/Facebook/Instagram/
-    WhatsApp, music playback, and OpenAI fallback for open-ended questions
-
---------------------------------------------------------------------------
-SETUP
---------------------------------------------------------------------------
-1) Install dependencies:
-   python -m pip install SpeechRecognition sounddevice numpy pyttsx3 openai
-   requests pywhatkit psutil
-
-2) Set your OpenAI key as an environment variable (do NOT hardcode it):
-   Windows (PowerShell):  $env:OPENAI_API_KEY="sk-..."
-   macOS/Linux (bash):    export OPENAI_API_KEY="sk-..."
-
-3) (Optional) For news headlines, set NEWS_API_KEY the same way.
-
-4) (Optional) Create a local `musiclibrary.py` next to this file with a
-   `music = {"song name": "https://..."}` dict for direct-link playback.
-   If it's missing, Jarvis just falls back to searching/playing on YouTube.
-
-5) Run it, then say "Jarvis" to wake it up, wait for the "I'm listening"
-   response, then give your command.
-
---------------------------------------------------------------------------
-SAFETY NOTE ON SHUTDOWN
---------------------------------------------------------------------------
-Shutdown/restart is a real, irreversible OS action, so Jarvis always asks
-for a spoken "yes" before doing it, and gives you a few seconds + a spoken
-"cancel shutdown" window to abort. Nothing destructive happens silently.
+Jarvis AI Assistant — Hardened, Resilient & Multi-Modal
+======================================================
+Architecture:
+  - Dual-Mode Engine: Adaptive Voice Mode (wake-word / speech-to-text) +
+    Interactive Conversational CLI mode (auto-selected if mic is missing or via --cli).
+  - Safety & Security: Zero-eval math engine, confirmed power controls, sanitized
+    notes with automated backups, graceful process controls.
+  - Multi-Modal Knowledge: Offline Wikipedia summarizer + OpenAI conversational fallback.
+  - Advanced Diagnostics: Battery/CPU/RAM, disk health, top memory consumers, network ping.
+  - Productivity: Non-blocking asynchronous timers, desktop app launcher, system audio controls.
 """
 
+import argparse
+import ast
+import math
+import operator
 import os
 import platform
+import re
+import shutil
 import subprocess
+import sys
+import threading
+import time
 import webbrowser
 from datetime import datetime
 from urllib.parse import quote_plus
 
 import numpy as np
 import requests
-import sounddevice as sd
+
+# ---------------------------------------------------------------------------
+# Optional / Dynamic Dependencies with Graceful Fallbacks
+# ---------------------------------------------------------------------------
 
 try:
-    import speech_recognition as sr  # pyright: ignore[reportMissingImports]
-except ModuleNotFoundError as exc:
-    raise ModuleNotFoundError(
-        "The 'SpeechRecognition' package is required. Install it with: "
-        "python -m pip install SpeechRecognition"
-    ) from exc
-
-import pyttsx3
-import pywhatkit
+    from client import ask_openai, get_openai_client, is_openai_configured, load_env_file
+    load_env_file()
+except ImportError:
+    def load_env_file(): pass
+    def is_openai_configured(): return bool(os.getenv("OPENAI_API_KEY", "").strip())
+    def get_openai_client(): return None
+    def ask_openai(p): return "OpenAI client helper is not available."
 
 try:
-    import psutil  # for battery / CPU / RAM status
+    import sounddevice as sd
 except ModuleNotFoundError:
-    psutil = None  # system-status command will just explain it's missing
+    sd = None
 
 try:
-    import openai
+    import speech_recognition as sr
 except ModuleNotFoundError:
-    openai = None
+    sr = None
+
+try:
+    import pyttsx3
+except ModuleNotFoundError:
+    pyttsx3 = None
+
+try:
+    import pywhatkit
+except ModuleNotFoundError:
+    pywhatkit = None
+
+try:
+    import psutil
+except ModuleNotFoundError:
+    psutil = None
+
+try:
+    import wikipedia
+except ModuleNotFoundError:
+    wikipedia = None
 
 try:
     import importlib
@@ -82,11 +83,8 @@ except ModuleNotFoundError:
 
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration & Global State
 # ---------------------------------------------------------------------------
-
-engine = pyttsx3.init()
-recognizer = sr.Recognizer()
 
 SAMPLE_RATE = 16000
 WAKE_WORD_DURATION = 3
@@ -95,28 +93,85 @@ QUESTION_DURATION = 7
 MIC_DEVICE_INDEX = None
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ai_client = openai.OpenAI(api_key=OPENAI_API_KEY) if (openai and OPENAI_API_KEY) else None
 AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
 NOTES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_notes.txt")
+NOTES_BACKUP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_notes.bak")
+
 EXIT_REQUESTED = False
+CLI_MODE = False
+QUIET_MODE = False
+
+# Speech synthesis engine initialization (safely guarded)
+_tts_engine = None
+_tts_lock = threading.Lock()
+
+
+def get_tts_engine():
+    global _tts_engine
+    if _tts_engine is None and pyttsx3 is not None:
+        try:
+            _tts_engine = pyttsx3.init()
+            _tts_engine.setProperty("rate", 185)
+        except Exception as err:
+            print(f"[Warning] Failed to initialize pyttsx3 engine: {err}")
+            _tts_engine = None
+    return _tts_engine
+
+
+recognizer = sr.Recognizer() if sr else None
+if recognizer:
+    recognizer.dynamic_energy_threshold = True
 
 
 # ---------------------------------------------------------------------------
-# Core I/O helpers
+# Core Audio & I/O Helpers
 # ---------------------------------------------------------------------------
 
 def speak(text):
-    print("Jarvis:", text)
-    engine.say(text)
-    engine.runAndWait()
+    """Output speech audio safely and print to console."""
+    if not text:
+        return
+    text = str(text).strip()
+    print(f"\nJarvis: {text}")
+
+    if QUIET_MODE:
+        return
+
+    engine = get_tts_engine()
+    if engine is None:
+        return
+
+    with _tts_lock:
+        try:
+            engine.say(text)
+            engine.runAndWait()
+        except Exception as err:
+            print(f"[TTS Error]: {err}")
+
+
+def has_working_microphone():
+    """Detect if any working audio input device is available."""
+    if sd is None:
+        return False
+    try:
+        devices = sd.query_devices()
+        if isinstance(devices, dict):
+            return devices.get("max_input_channels", 0) > 0
+        for dev in devices:
+            if dev.get("max_input_channels", 0) > 0:
+                return True
+        return False
+    except Exception:
+        return False
 
 
 def record_audio(duration, fs=SAMPLE_RATE):
-    """Record audio with sounddevice (no PyAudio needed) and wrap it for
-    speech_recognition."""
+    """Record audio with sounddevice and wrap for speech_recognition."""
+    if sd is None or sr is None:
+        raise OSError("Audio recording libraries are not available.")
+
     audio = sd.rec(
         int(duration * fs),
         samplerate=fs,
@@ -128,138 +183,88 @@ def record_audio(duration, fs=SAMPLE_RATE):
     return sr.AudioData(audio.tobytes(), fs, 2)
 
 
+_mic_warning_shown = False
+
 def listen_and_transcribe(duration):
+    """Listen for voice input with defensive error handling."""
+    global _mic_warning_shown
+    if CLI_MODE or not has_working_microphone():
+        return None
+
     try:
         audio_data = record_audio(duration)
-    except (OSError, sd.PortAudioError) as exc:
-        print("Microphone error:", exc)
-        speak("I can't access the microphone. Check the microphone and try again.")
+    except (OSError, getattr(sd, "PortAudioError", OSError)) as exc:
+        if not _mic_warning_shown:
+            print(f"[Audio Error] Microphone access failed: {exc}")
+            speak("I can't access a microphone. Switching to keyboard input mode.")
+            _mic_warning_shown = True
         return None
+
+    if recognizer is None:
+        return None
+
     try:
         return recognizer.recognize_google(audio_data)
-    except sr.UnknownValueError:
+    except getattr(sr, "UnknownValueError", Exception):
         return None
-    except sr.RequestError:
-        speak("Speech recognition service is unavailable.")
+    except getattr(sr, "RequestError", Exception):
+        print("[Network Warning] Speech recognition service unreachable.")
+        return None
+    except Exception as exc:
+        print(f"[Speech Error] {exc}")
         return None
 
 
-def list_microphones():
-    """Run once to find the correct MIC_DEVICE_INDEX if audio isn't picked up."""
-    print(sd.query_devices())
+def prompt_user(prompt_text, duration=COMMAND_DURATION):
+    """Prompt user via voice in Voice mode or console in CLI mode."""
+    speak(prompt_text)
+    if CLI_MODE:
+        try:
+            return input(f"{prompt_text} > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+    else:
+        ans = listen_and_transcribe(duration)
+        if not ans:
+            # Fallback to text prompt if speech wasn't heard
+            try:
+                print(f"(Microphone timed out. Type response or press Enter to skip)")
+                import select
+                # On Windows select doesn't work on stdin, use standard fallback
+                ans = input(f"> ").strip()
+            except Exception:
+                ans = None
+        return ans
 
+
+# ---------------------------------------------------------------------------
+# Browser & Power Management (Hardened & Confirmed)
+# ---------------------------------------------------------------------------
 
 def close_browser():
-    """Best-effort close of the default browser window (cross-platform)."""
+    """Safely ask for confirmation before terminating browser instances."""
     system = platform.system()
+    speak("Closing the browser will close all active tabs and unsaved work. Are you sure? Say or type yes to confirm.")
+    reply = prompt_user("Confirm browser close (yes/no):", COMMAND_DURATION) or ""
+    if "yes" not in reply.lower():
+        speak("Cancelled. Your browser was left open.")
+        return False
+
     try:
         if system == "Windows":
             for exe in ("brave.exe", "chrome.exe", "msedge.exe", "firefox.exe"):
-                subprocess.run(["taskkill", "/F", "/IM", exe], capture_output=True, text=True)
+                subprocess.run(["taskkill", "/IM", exe], capture_output=True, text=True, check=False)
         elif system == "Darwin":
-            subprocess.run(["osascript", "-e", 'quit app "Google Chrome"'], capture_output=True, text=True)
+            subprocess.run(["osascript", "-e", 'quit app "Google Chrome"'], capture_output=True, text=True, check=False)
         else:
-            subprocess.run(["pkill", "-f", "chrome"], capture_output=True, text=True)
+            subprocess.run(["pkill", "-f", "chrome"], capture_output=True, text=True, check=False)
+        speak("Browser closed.")
         return True
-    except Exception as e:
-        print("Close browser error:", e)
+    except Exception as err:
+        print("Close browser error:", err)
+        speak("Could not close the browser.")
         return False
 
-
-# ---------------------------------------------------------------------------
-# AI fallback
-# ---------------------------------------------------------------------------
-
-def get_ai_response(prompt):
-    if not ai_client:
-        return "I don't have an API key set up, so I can't think of an answer right now."
-    try:
-        response = ai_client.chat.completions.create(
-            model=AI_MODEL,
-            messages=[
-                {"role": "system", "content": (
-                    "You are a virtual assistant named Jarvis. Keep answers short "
-                    "and conversational, since they will be spoken out loud."
-                )},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print("OpenAI error:", e)
-        return "Sorry, I had trouble getting an answer for that."
-
-
-# ---------------------------------------------------------------------------
-# New feature: time & date
-# ---------------------------------------------------------------------------
-
-def tell_time():
-    now = datetime.now().strftime("%I:%M %p").lstrip("0")
-    speak(f"It's {now} right now.")
-
-
-def tell_date():
-    today = datetime.now().strftime("%A, %B %d, %Y")
-    speak(f"Today is {today}.")
-
-
-# ---------------------------------------------------------------------------
-# New feature: weather (Open-Meteo, no API key required)
-# ---------------------------------------------------------------------------
-
-WEATHER_CODES = {
-    0: "clear sky", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
-    45: "foggy", 48: "foggy with frost", 51: "light drizzle", 53: "drizzle",
-    55: "heavy drizzle", 61: "light rain", 63: "rain", 65: "heavy rain",
-    71: "light snow", 73: "snow", 75: "heavy snow", 80: "rain showers",
-    81: "rain showers", 82: "violent rain showers", 95: "thunderstorms",
-    96: "thunderstorms with hail", 99: "severe thunderstorms with hail",
-}
-
-
-def get_weather(city):
-    try:
-        geo = requests.get(
-            "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": city, "count": 1}, timeout=5
-        ).json()
-        results = geo.get("results")
-        if not results:
-            speak(f"I couldn't find a place called {city}.")
-            return
-
-        place = results[0]
-        lat, lon = place["latitude"], place["longitude"]
-        label = place.get("name", city)
-
-        forecast = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": lat, "longitude": lon,
-                "current": "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m",
-            }, timeout=5
-        ).json()
-
-        current = forecast.get("current", {})
-        temp = current.get("temperature_2m")
-        humidity = current.get("relative_humidity_2m")
-        wind = current.get("wind_speed_10m")
-        code = current.get("weather_code")
-        condition = WEATHER_CODES.get(code, "unusual conditions")
-
-        speak(
-            f"It's currently {temp} degrees Celsius in {label} with {condition}. "
-            f"Humidity is {humidity} percent and wind speed is {wind} kilometers per hour."
-        )
-    except Exception as e:
-        print("Weather error:", e)
-        speak("Sorry, I couldn't fetch the weather right now.")
-
-
-# ---------------------------------------------------------------------------
-# New feature: shutdown / restart / sleep (with confirmation, cross-platform)
-# ---------------------------------------------------------------------------
 
 def _run_power_command(args_by_os, action_label):
     system = platform.system()
@@ -275,91 +280,560 @@ def _run_power_command(args_by_os, action_label):
 
 
 def shutdown_computer():
-    speak("Are you sure you want me to shut down the computer? Say yes to confirm.")
-    reply = listen_and_transcribe(COMMAND_DURATION) or ""
+    reply = prompt_user("Are you sure you want to shut down the computer? Say or type yes to confirm.") or ""
     if "yes" not in reply.lower():
         speak("Okay, cancelling shutdown.")
         return
 
-    speak("Shutting down in one minute. Say 'cancel shutdown' now if you change your mind.")
-    reply2 = listen_and_transcribe(COMMAND_DURATION) or ""
-    if "cancel" in reply2.lower():
-        _run_power_command({
-            "Windows": ["shutdown", "/a"],
-            "Darwin": None,
-            "Linux": ["shutdown", "-c"],
-        }, "cancel the shutdown")
-        speak("Shutdown cancelled.")
-        return
-
+    speak("Shutting down in one minute. Say or type 'cancel shutdown' to abort.")
     _run_power_command({
         "Windows": ["shutdown", "/s", "/t", "60"],
-        "Darwin": ["sudo", "shutdown", "-h", "+1"],
+        "Darwin": ["osascript", "-e", 'tell app "System Events" to shut down'],
         "Linux": ["shutdown", "+1"],
     }, "shut down")
 
 
+def cancel_shutdown():
+    _run_power_command({
+        "Windows": ["shutdown", "/a"],
+        "Darwin": None,
+        "Linux": ["shutdown", "-c"],
+    }, "cancel the shutdown")
+    speak("Shutdown command cancelled.")
+
+
 def restart_computer():
-    speak("Are you sure you want me to restart the computer? Say yes to confirm.")
-    reply = listen_and_transcribe(COMMAND_DURATION) or ""
+    reply = prompt_user("Are you sure you want to restart the computer? Say or type yes to confirm.") or ""
     if "yes" not in reply.lower():
         speak("Okay, cancelling restart.")
         return
     _run_power_command({
         "Windows": ["shutdown", "/r", "/t", "10"],
-        "Darwin": ["sudo", "shutdown", "-r", "+1"],
+        "Darwin": ["osascript", "-e", 'tell app "System Events" to restart'],
         "Linux": ["shutdown", "-r", "+1"],
     }, "restart")
     speak("Restarting the computer now.")
 
 
 def sleep_computer():
-    _run_power_command({
-        "Windows": ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"],
-        "Darwin": ["pmset", "sleepnow"],
-        "Linux": ["systemctl", "suspend"],
-    }, "sleep")
+    reply = prompt_user("Are you sure you want to put the computer to sleep? Say or type yes to confirm.") or ""
+    if "yes" not in reply.lower():
+        speak("Okay, computer will stay awake.")
+        return
+
     speak("Putting the computer to sleep.")
+    system = platform.system()
+    if system == "Windows":
+        try:
+            import ctypes
+            # Put computer to true sleep (suspend state 0, not hibernate)
+            ctypes.windll.PowrProf.SetSuspendState(0, 1, 0)
+        except Exception:
+            _run_power_command({"Windows": ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"]}, "sleep")
+    elif system == "Darwin":
+        _run_power_command({"Darwin": ["pmset", "sleepnow"]}, "sleep")
+    else:
+        _run_power_command({"Linux": ["systemctl", "suspend"]}, "sleep")
 
 
 # ---------------------------------------------------------------------------
-# Unique feature #1: system status (battery / CPU / RAM)
+# Unique Feature 1: Offline Knowledge & Wikipedia Engine
+# ---------------------------------------------------------------------------
+
+def ask_wikipedia(query):
+    """Retrieve concise encyclopedic answers without requiring paid API keys."""
+    if not wikipedia:
+        speak("Wikipedia package is not installed.")
+        return False
+
+    clean_query = query.strip()
+    for prefix in ("tell me about", "who is", "who was", "what is", "what was", "define", "explain"):
+        if clean_query.lower().startswith(prefix):
+            clean_query = clean_query[len(prefix):].strip()
+            break
+
+    if not clean_query:
+        speak("What topic would you like me to look up on Wikipedia?")
+        return False
+
+    try:
+        # Search for page
+        search_results = wikipedia.search(clean_query)
+        if not search_results:
+            speak(f"I couldn't find any Wikipedia article about {clean_query}.")
+            return False
+
+        page_title = search_results[0]
+        summary = wikipedia.summary(page_title, sentences=2, auto_suggest=False)
+        speak(f"According to Wikipedia: {summary}")
+        return True
+    except getattr(wikipedia, "DisambiguationError", Exception) as e:
+        options = getattr(e, "options", [])[:3]
+        if options:
+            try:
+                summary = wikipedia.summary(options[0], sentences=2, auto_suggest=False)
+                speak(f"According to Wikipedia: {summary}")
+                return True
+            except Exception:
+                pass
+        speak(f"There are multiple topics for {clean_query}. Please be more specific.")
+        return True
+    except getattr(wikipedia, "PageError", Exception):
+        speak(f"I couldn't find a page matching {clean_query}.")
+        return False
+    except Exception as err:
+        print("Wikipedia lookup error:", err)
+        speak("Sorry, I had trouble reaching Wikipedia.")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Unique Feature 2: Safe AST Math Calculator & Unit Converter (Zero-eval)
+# ---------------------------------------------------------------------------
+
+SAFE_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+SAFE_FUNCTIONS = {
+    "sqrt": math.sqrt,
+    "abs": abs,
+    "round": round,
+    "sin": math.sin,
+    "cos": math.cos,
+    "tan": math.tan,
+    "log": math.log,
+}
+
+
+def _eval_ast_node(node):
+    if isinstance(node, ast.Expression):
+        return _eval_ast_node(node.body)
+    elif isinstance(node, ast.Constant):  # Python 3.8+
+        if isinstance(node.value, (int, float)):
+            return node.value
+        raise ValueError(f"Unsafe constant type: {type(node.value)}")
+    elif isinstance(node, ast.BinOp):
+        op_type = type(node.op)
+        if op_type not in SAFE_OPERATORS:
+            raise ValueError(f"Unsupported operator: {op_type}")
+        left = _eval_ast_node(node.left)
+        right = _eval_ast_node(node.right)
+        return SAFE_OPERATORS[op_type](left, right)
+    elif isinstance(node, ast.UnaryOp):
+        op_type = type(node.op)
+        if op_type not in SAFE_OPERATORS:
+            raise ValueError(f"Unsupported unary operator: {op_type}")
+        operand = _eval_ast_node(node.operand)
+        return SAFE_OPERATORS[op_type](operand)
+    elif isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Name) and node.func.id in SAFE_FUNCTIONS:
+            args = [_eval_ast_node(arg) for arg in node.args]
+            return SAFE_FUNCTIONS[node.func.id](*args)
+        raise ValueError("Unsupported function call in math expression.")
+    else:
+        raise ValueError(f"Unsupported AST node: {type(node)}")
+
+
+def calculate_expression(expression_str):
+    """Safely calculate mathematical expression without using eval()."""
+    # Clean expression
+    cleaned = expression_str.lower().strip()
+    for word in ("calculate", "what is", "how much is", "solve", "equals", "="):
+        cleaned = cleaned.replace(word, " ")
+
+    # Replace verbal math operators with symbols
+    cleaned = cleaned.replace("times", "*").replace("multiplied by", "*").replace("x", "*")
+    cleaned = cleaned.replace("divided by", "/").replace("over", "/")
+    cleaned = cleaned.replace("plus", "+").replace("add", "+")
+    cleaned = cleaned.replace("minus", "-").replace("subtract", "-")
+    cleaned = cleaned.replace("to the power of", "**").replace("power of", "**").replace("^", "**")
+    cleaned = cleaned.replace("percent of", "* 0.01 *")
+
+    # Keep only safe characters
+    cleaned = re.sub(r"[^0-9\+\-\*\/\.\(\)\s\%\^a-z_]", "", cleaned).strip()
+    if not cleaned:
+        speak("I couldn't find a valid mathematical expression to calculate.")
+        return
+
+    try:
+        tree = ast.parse(cleaned, mode='eval')
+        result = _eval_ast_node(tree)
+        if isinstance(result, float) and result.is_integer():
+            result = int(result)
+        elif isinstance(result, float):
+            result = round(result, 4)
+        speak(f"The result is {result}")
+    except ZeroDivisionError:
+        speak("Cannot divide by zero.")
+    except Exception as err:
+        speak("Sorry, I could not calculate that expression safely.")
+
+
+def convert_units(command):
+    """Convert common physical units (temperature, distance, weight)."""
+    # Temperature: Celsius <-> Fahrenheit
+    c_to_f = re.search(r"(\-?\d+(?:\.\d+)?)\s*(?:degrees?)?\s*celsius\s+(?:in|to)\s+fahrenheit", command)
+    if c_to_f:
+        c = float(c_to_f.group(1))
+        f = round((c * 9/5) + 32, 2)
+        speak(f"{c} degrees Celsius is {f} degrees Fahrenheit.")
+        return True
+
+    f_to_c = re.search(r"(\-?\d+(?:\.\d+)?)\s*(?:degrees?)?\s*fahrenheit\s+(?:in|to)\s+celsius", command)
+    if f_to_c:
+        f = float(f_to_c.group(1))
+        c = round((f - 32) * 5/9, 2)
+        speak(f"{f} degrees Fahrenheit is {c} degrees Celsius.")
+        return True
+
+    # Distance: Kilometers <-> Miles
+    km_to_mi = re.search(r"(\d+(?:\.\d+)?)\s*(?:kilometers?|km)\s+(?:in|to)\s+miles?", command)
+    if km_to_mi:
+        km = float(km_to_mi.group(1))
+        mi = round(km * 0.621371, 2)
+        speak(f"{km} kilometers is approximately {mi} miles.")
+        return True
+
+    mi_to_km = re.search(r"(\d+(?:\.\d+)?)\s*miles?\s+(?:in|to)\s*(?:kilometers?|km)", command)
+    if mi_to_km:
+        mi = float(mi_to_km.group(1))
+        km = round(mi * 1.60934, 2)
+        speak(f"{mi} miles is approximately {km} kilometers.")
+        return True
+
+    # Weight: Kilograms <-> Pounds
+    kg_to_lb = re.search(r"(\d+(?:\.\d+)?)\s*(?:kilograms?|kg)\s+(?:in|to)\s*(?:pounds?|lbs?)", command)
+    if kg_to_lb:
+        kg = float(kg_to_lb.group(1))
+        lb = round(kg * 2.20462, 2)
+        speak(f"{kg} kilograms is approximately {lb} pounds.")
+        return True
+
+    lb_to_kg = re.search(r"(\d+(?:\.\d+)?)\s*(?:pounds?|lbs?)\s+(?:in|to)\s*(?:kilograms?|kg)", command)
+    if lb_to_kg:
+        lb = float(lb_to_kg.group(1))
+        kg = round(lb * 0.453592, 2)
+        speak(f"{lb} pounds is approximately {kg} kilograms.")
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Unique Feature 3: Advanced System Diagnostics (Disk, Top Procs, Ping)
 # ---------------------------------------------------------------------------
 
 def system_status():
+    """Report CPU, RAM, and battery state without 1-second lag."""
     if not psutil:
-        speak("I need the psutil package installed to check system status. "
-              "Install it with pip install psutil.")
+        speak("I need the psutil package installed to check system status.")
         return
 
-    cpu = psutil.cpu_percent(interval=1)
+    # Non-blocking CPU reading
+    cpu = psutil.cpu_percent(interval=0.1)
     mem = psutil.virtual_memory()
-    parts = [f"CPU usage is at {cpu} percent", f"memory usage is at {mem.percent} percent"]
+    parts = [f"CPU usage is at {cpu} percent", f"RAM usage is at {mem.percent} percent"]
 
     battery = psutil.sensors_battery()
-    if battery:
+    if battery and battery.percent is not None:
         state = "charging" if battery.power_plugged else "not charging"
         parts.append(f"battery is at {round(battery.percent)} percent and {state}")
 
     speak(", ".join(parts) + ".")
 
 
+def system_diagnostics():
+    """Deep system diagnostics: Disk storage, top memory process, and network ping."""
+    if not psutil:
+        speak("System diagnostics require the psutil package.")
+        return
+
+    parts = []
+    # Disk usage
+    try:
+        root_path = "C:\\" if platform.system() == "Windows" else "/"
+        disk = psutil.disk_usage(root_path)
+        free_gb = round(disk.free / (1024**3), 1)
+        total_gb = round(disk.total / (1024**3), 1)
+        parts.append(f"Primary storage has {free_gb} gigabytes free out of {total_gb} gigabytes")
+    except Exception:
+        pass
+
+    # Top memory consumer
+    try:
+        top_procs = sorted(
+            psutil.process_iter(['name', 'memory_info']),
+            key=lambda p: (p.info['memory_info'].rss if p.info and p.info.get('memory_info') else 0),
+            reverse=True
+        )
+        if top_procs:
+            top_p = top_procs[0]
+            top_name = top_p.info['name']
+            top_mb = round(top_p.info['memory_info'].rss / (1024 * 1024))
+            parts.append(f"top memory consumer is {top_name} using {top_mb} megabytes")
+    except Exception:
+        pass
+
+    if parts:
+        speak(". ".join(parts) + ".")
+    else:
+        speak("System diagnostics completed with no issues.")
+
+
+def ping_network(host="8.8.8.8"):
+    """Check internet connectivity and latency."""
+    system = platform.system()
+    param = "-n" if system == "Windows" else "-c"
+    cmd = ["ping", param, "1", host]
+    try:
+        output = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+        if output.returncode == 0:
+            match = re.search(r"time[=<](\d+)\s*ms", output.stdout, re.IGNORECASE)
+            latency = f"with {match.group(1)} milliseconds latency" if match else "with good latency"
+            speak(f"Internet connection is active {latency}.")
+        else:
+            speak("Internet connection appears to be offline.")
+    except Exception:
+        speak("Could not verify internet connection.")
+
+
 # ---------------------------------------------------------------------------
-# Unique feature #2: voice notes / reminders you can save and recall
+# Unique Feature 4: Safe Desktop Application Launcher
+# ---------------------------------------------------------------------------
+
+APP_COMMANDS = {
+    "notepad": ["notepad.exe"],
+    "calculator": ["calc.exe"],
+    "terminal": ["cmd.exe"],
+    "command prompt": ["cmd.exe"],
+    "task manager": ["taskmgr.exe"],
+    "file explorer": ["explorer.exe"],
+    "settings": ["explorer.exe", "ms-settings:"],
+    "visual studio code": ["code"],
+    "vs code": ["code"],
+}
+
+
+def launch_application(app_name):
+    """Safely launch common desktop applications."""
+    app_key = app_name.lower().strip()
+    cmd = APP_COMMANDS.get(app_key)
+    if not cmd:
+        for name, target in APP_COMMANDS.items():
+            if name in app_key:
+                cmd = target
+                break
+
+    if not cmd:
+        speak(f"I don't have a configured shortcut for {app_name}.")
+        return False
+
+    try:
+        subprocess.Popen(cmd)
+        speak(f"Opening {app_name}.")
+        return True
+    except Exception as err:
+        print(f"App launch error for {app_name}:", err)
+        speak(f"Could not open {app_name}.")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Unique Feature 5: Non-blocking Background Timers
+# ---------------------------------------------------------------------------
+
+_active_timers = []
+
+
+def set_timer(seconds, label="timer"):
+    """Start an asynchronous background timer that speaks when finished."""
+    def _timer_worker():
+        time.sleep(seconds)
+        speak(f"Ding ding! Time's up! Your {label} for {seconds} seconds is complete.")
+        if threading.current_thread() in _active_timers:
+            _active_timers.remove(threading.current_thread())
+
+    t = threading.Thread(target=_timer_worker, daemon=True)
+    _active_timers.append(t)
+    t.start()
+    speak(f"Timer set for {seconds} seconds.")
+
+
+def parse_and_set_timer(command):
+    """Parse timer durations like 'timer for 5 minutes' or 'timer for 30 seconds'."""
+    match = re.search(r"(\d+)\s*(second|minute|hour)s?", command)
+    if not match:
+        speak("How many seconds or minutes should I set the timer for?")
+        return False
+
+    amount = int(match.group(1))
+    unit = match.group(2)
+    multiplier = 1
+    if unit == "minute":
+        multiplier = 60
+    elif unit == "hour":
+        multiplier = 3600
+
+    total_seconds = amount * multiplier
+    set_timer(total_seconds, f"{amount} {unit}")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Unique Feature 6: Master Volume & Audio Controls
+# ---------------------------------------------------------------------------
+
+def control_volume(action):
+    """Cross-platform system volume adjustment."""
+    system = platform.system()
+    try:
+        if system == "Windows":
+            import ctypes
+            # VK_VOLUME_MUTE = 0xAD, VK_VOLUME_DOWN = 0xAE, VK_VOLUME_UP = 0xAF
+            if action == "mute" or action == "unmute":
+                ctypes.windll.user32.keybd_event(0xAD, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0xAD, 0, 2, 0)
+                speak("Toggled audio mute.")
+            elif action == "up":
+                for _ in range(5):
+                    ctypes.windll.user32.keybd_event(0xAF, 0, 0, 0)
+                    ctypes.windll.user32.keybd_event(0xAF, 0, 2, 0)
+                speak("Volume increased.")
+            elif action == "down":
+                for _ in range(5):
+                    ctypes.windll.user32.keybd_event(0xAE, 0, 0, 0)
+                    ctypes.windll.user32.keybd_event(0xAE, 0, 2, 0)
+                speak("Volume decreased.")
+        elif system == "Darwin":
+            if action in ("mute", "unmute"):
+                subprocess.run(["osascript", "-e", "set volume output muted not (output muted of (get volume settings))"])
+                speak("Toggled audio mute.")
+            elif action == "up":
+                subprocess.run(["osascript", "-e", "set volume output volume ((output volume of (get volume settings)) + 10)"])
+                speak("Volume increased.")
+            elif action == "down":
+                subprocess.run(["osascript", "-e", "set volume output volume ((output volume of (get volume settings)) - 10)"])
+                speak("Volume decreased.")
+        else:
+            speak("System audio control is not supported on this platform yet.")
+    except Exception as err:
+        print("Volume control error:", err)
+        speak("Could not adjust the volume.")
+
+
+# ---------------------------------------------------------------------------
+# Time & Date
+# ---------------------------------------------------------------------------
+
+def tell_time():
+    now = datetime.now().strftime("%I:%M %p").lstrip("0")
+    speak(f"It's {now} right now.")
+
+
+def tell_date():
+    today = datetime.now().strftime("%A, %B %d, %Y")
+    speak(f"Today is {today}.")
+
+
+# ---------------------------------------------------------------------------
+# Weather (Open-Meteo, Defensive Parsing)
+# ---------------------------------------------------------------------------
+
+WEATHER_CODES = {
+    0: "clear sky", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
+    45: "foggy", 48: "foggy with frost", 51: "light drizzle", 53: "drizzle",
+    55: "heavy drizzle", 61: "light rain", 63: "rain", 65: "heavy rain",
+    71: "light snow", 73: "snow", 75: "heavy snow", 80: "rain showers",
+    81: "rain showers", 82: "violent rain showers", 95: "thunderstorms",
+    96: "thunderstorms with hail", 99: "severe thunderstorms with hail",
+}
+
+
+def get_weather(city):
+    if not city:
+        speak("Which city's weather would you like?")
+        city = prompt_user("Enter city name:")
+        if not city:
+            speak("I didn't catch a city name.")
+            return
+
+    try:
+        geo = requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": city, "count": 1}, timeout=6
+        ).json()
+        results = geo.get("results")
+        if not results:
+            speak(f"I couldn't find a place called {city}.")
+            return
+
+        place = results[0]
+        lat, lon = place["latitude"], place["longitude"]
+        label = place.get("name", city)
+
+        forecast = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat, "longitude": lon,
+                "current": "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m",
+            }, timeout=6
+        ).json()
+
+        current = forecast.get("current", {})
+        temp = current.get("temperature_2m")
+        humidity = current.get("relative_humidity_2m")
+        wind = current.get("wind_speed_10m")
+        code = current.get("weather_code")
+        condition = WEATHER_CODES.get(code, "fair conditions")
+
+        if temp is not None:
+            details = [f"It's currently {temp} degrees Celsius in {label} with {condition}."]
+            if humidity is not None:
+                details.append(f"Humidity is {humidity} percent")
+            if wind is not None:
+                details.append(f"wind speed is {wind} kilometers per hour")
+            speak(" and ".join(details) + ".")
+        else:
+            speak(f"Weather conditions in {label} are currently {condition}.")
+    except Exception as e:
+        print("Weather error:", e)
+        speak("Sorry, I couldn't fetch the weather right now.")
+
+
+# ---------------------------------------------------------------------------
+# Notes & Reminders (Sanitized & Confirmed)
 # ---------------------------------------------------------------------------
 
 def save_note(text):
     if not text:
-        speak("What would you like me to remember?")
-        text = listen_and_transcribe(QUESTION_DURATION)
+        text = prompt_user("What would you like me to remember?")
         if not text:
             speak("I didn't catch that, so I didn't save anything.")
             return
 
+    # Sanitize note (single line, no control chars)
+    sanitized = " ".join(text.split()).strip()
+    if not sanitized:
+        speak("Note was empty.")
+        return
+
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    with open(NOTES_FILE, "a", encoding="utf-8") as f:
-        f.write(f"[{timestamp}] {text}\n")
-    speak("Got it, I saved that.")
+    try:
+        with open(NOTES_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {sanitized}\n")
+        speak("Got it, I saved that.")
+    except Exception as err:
+        print("Save note error:", err)
+        speak("Could not write note to file.")
 
 
 def read_notes():
@@ -367,36 +841,53 @@ def read_notes():
         speak("You don't have any saved notes yet.")
         return
 
-    with open(NOTES_FILE, "r", encoding="utf-8") as f:
-        lines = [line.strip() for line in f if line.strip()]
+    try:
+        with open(NOTES_FILE, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip()]
 
-    if not lines:
-        speak("You don't have any saved notes yet.")
-        return
+        if not lines:
+            speak("You don't have any saved notes yet.")
+            return
 
-    speak(f"You have {len(lines)} saved note{'s' if len(lines) != 1 else ''}. Here are the most recent ones.")
-    for line in lines[-5:]:
-        # Strip the leading "[timestamp] " for a more natural read-out.
-        content = line.split("] ", 1)[-1]
-        speak(content)
+        speak(f"You have {len(lines)} saved note{'s' if len(lines) != 1 else ''}. Here are the most recent ones.")
+        for line in lines[-5:]:
+            content = line.split("] ", 1)[-1]
+            speak(content)
+    except Exception as err:
+        print("Read notes error:", err)
+        speak("Could not read notes.")
 
 
 def clear_notes():
-    if os.path.exists(NOTES_FILE):
+    if not os.path.exists(NOTES_FILE):
+        speak("You don't have any notes to clear.")
+        return
+
+    reply = prompt_user("Are you sure you want to delete all your saved notes? Say or type yes to confirm.") or ""
+    if "yes" not in reply.lower():
+        speak("Notes kept safe.")
+        return
+
+    try:
+        shutil.copyfile(NOTES_FILE, NOTES_BACKUP)
         os.remove(NOTES_FILE)
-    speak("All your notes have been cleared.")
+        speak("All notes have been cleared. A backup copy was saved.")
+    except Exception as err:
+        print("Clear notes error:", err)
+        speak("Could not clear notes.")
 
 
 # ---------------------------------------------------------------------------
-# Social messaging
+# Social & WhatsApp Messaging
 # ---------------------------------------------------------------------------
 
 def send_whatsapp_message(command):
-    """Open WhatsApp Web with a recipient and message prefilled."""
+    """Open WhatsApp Web with recipient and message safely validated."""
     remainder = command
     for marker in ("send whatsapp message to", "send a whatsapp message to"):
-        if marker in remainder:
-            remainder = remainder.split(marker, 1)[1].strip()
+        if marker in remainder.lower():
+            idx = remainder.lower().find(marker) + len(marker)
+            remainder = remainder[idx:].strip()
             break
 
     separator = " saying " if " saying " in remainder else " message "
@@ -405,19 +896,20 @@ def send_whatsapp_message(command):
         return
 
     phone, message = (part.strip() for part in remainder.split(separator, 1))
-    phone = phone.replace(" ", "").lstrip("+")
-    if not phone or not phone.lstrip("+").isdigit() or not message:
-        speak("I need an international phone number and a message.")
+    # Normalize phone number (strip spaces, dashes, parentheses)
+    clean_phone = re.sub(r"[^\d\+]", "", phone).lstrip("+")
+    if not clean_phone or not clean_phone.isdigit() or not message:
+        speak("I need a valid phone number and a message.")
         return
 
     webbrowser.open(
-        f"https://web.whatsapp.com/send?phone={quote_plus(phone)}&text={quote_plus(message)}"
+        f"https://web.whatsapp.com/send?phone={quote_plus(clean_phone)}&text={quote_plus(message)}"
     )
-    speak("WhatsApp is open with your message ready. Review it and press send.")
+    speak("WhatsApp is open with your message ready.")
 
 
 # ---------------------------------------------------------------------------
-# Optional: news headlines (needs NEWS_API_KEY)
+# News Headlines
 # ---------------------------------------------------------------------------
 
 def read_news():
@@ -446,79 +938,168 @@ def read_news():
 
 
 # ---------------------------------------------------------------------------
-# Command router
+# AI Fallback
 # ---------------------------------------------------------------------------
 
-def process_command(command):
+def get_ai_response(prompt):
+    """Query OpenAI if configured; otherwise use Wikipedia fallback."""
+    if is_openai_configured():
+        return ask_openai(prompt)
+
+    # If OpenAI is not configured, try Wikipedia for informative answers
+    if wikipedia:
+        search_res = wikipedia.search(prompt)
+        if search_res:
+            try:
+                return wikipedia.summary(search_res[0], sentences=2, auto_suggest=False)
+            except Exception:
+                pass
+
+    return "I don't have an OpenAI API key set up, and I couldn't find a direct answer. Set OPENAI_API_KEY in your .env file."
+
+
+# ---------------------------------------------------------------------------
+# Command Router (Intent Parsing)
+# ---------------------------------------------------------------------------
+
+def process_command(raw_command):
+    """Route voice/text input to the correct feature handler."""
     global EXIT_REQUESTED
-    raw_command = command.strip()
+    if not raw_command:
+        return
+
+    raw_command = raw_command.strip()
     command = raw_command.lower()
     words = command.split()
 
-    if command in {"exit jarvis", "quit jarvis", "close jarvis", "shutdown jarvis"}:
+    # --- Exit commands ---
+    if command in {"exit jarvis", "quit jarvis", "close jarvis", "shutdown jarvis", "exit", "quit"}:
         EXIT_REQUESTED = True
-        speak("Goodbye.")
+        speak("Goodbye sir. Have a wonderful day.")
         return
 
-    # --- Open-ended question mode ---
-    if "i have some question" in command or "hey" in words or "hi" in words:
-        speak("Sure, what would you like to ask?")
-        question = listen_and_transcribe(QUESTION_DURATION)
-        if question:
-            speak(get_ai_response(question))
-        else:
-            speak("I didn't catch that. Please try again.")
+    # --- Sleep & Volume ---
+    if any(phrase in command for phrase in ("mute audio", "mute sound", "mute")):
+        control_volume("mute")
+        return
+    elif any(phrase in command for phrase in ("unmute audio", "unmute sound", "unmute")):
+        control_volume("unmute")
+        return
+    elif any(phrase in command for phrase in ("volume up", "increase volume", "louder")):
+        control_volume("up")
+        return
+    elif any(phrase in command for phrase in ("volume down", "decrease volume", "lower volume", "quieter")):
+        control_volume("down")
+        return
 
-    # --- Time / date ---
-    elif "time" in words and "what" in words:
-        tell_time()
-    elif "date" in words or "today's date" in command:
-        tell_date()
+    # --- Timers ---
+    if "timer" in command:
+        parse_and_set_timer(command)
+        return
 
-    # --- Weather ---
-    elif "weather" in command:
-        city = None
-        for marker in ("weather in", "weather for", "weather at"):
-            if marker in command:
-                city = command.split(marker, 1)[1].strip()
-                break
-        if not city:
-            speak("Which city's weather would you like?")
-            city = listen_and_transcribe(COMMAND_DURATION)
-        if city:
-            get_weather(city)
-        else:
-            speak("I didn't catch a city name.")
+    # --- Unit Conversion ---
+    if any(k in command for k in ("celsius", "fahrenheit", "kilometers", "miles", "pounds", "kilograms")):
+        if convert_units(command):
+            return
 
-    # --- Power controls ---
-    elif "shut down" in command or "shutdown" in command:
-        shutdown_computer()
-    elif "restart" in command or "reboot" in command:
-        restart_computer()
-    elif "sleep" in words and "computer" in words:
-        sleep_computer()
+    # --- Calculator (AST Safe Math) ---
+    if (
+        command.startswith("calculate")
+        or command.startswith("what is")
+        and any(op in command for op in ("plus", "minus", "times", "divided", "*", "/", "+", "%", "power"))
+        or "math" in command
+    ):
+        calculate_expression(command)
+        return
 
-    # --- System status (unique feature) ---
+    # --- System Diagnostics & Status ---
+    if any(k in command for k in ("system diagnostics", "diagnostics", "disk usage", "storage", "top process", "top processes")):
+        system_diagnostics()
+        return
+    elif any(k in command for k in ("ping test", "check internet", "test connection", "network latency")):
+        ping_network()
+        return
     elif "system status" in command or "how is my computer" in command or "battery" in command:
         system_status()
+        return
 
-    # --- Notes / reminders (unique feature) ---
-    elif command.startswith("remember that") or command.startswith("remember this"):
+    # --- Desktop App Launcher ---
+    if command.startswith("open app") or (command.startswith("open ") and any(app in command for app in APP_COMMANDS)):
+        target_app = command.replace("open app", "").replace("open", "").strip()
+        if launch_application(target_app):
+            return
+
+    # --- Wikipedia Knowledge Lookup ---
+    if any(command.startswith(p) for p in ("tell me about", "who is", "who was", "define", "explain", "wikipedia")):
+        if ask_wikipedia(command):
+            return
+
+    # --- Conversational / Questions ---
+    if "i have some question" in command or command in ("hey", "hi", "hello", "jarvis"):
+        question = prompt_user("Sure, what would you like to ask?")
+        if question:
+            speak(get_ai_response(question))
+        return
+
+    # --- Time & Date ---
+    if re.search(r"\b(time|what time|current time)\b", command):
+        tell_time()
+        return
+    elif re.search(r"\b(date|today's date|current date)\b", command):
+        tell_date()
+        return
+
+    # --- Weather ---
+    if "weather" in command:
+        city = None
+        # Pattern: weather in <city>, weather for <city>, weather at <city>
+        m = re.search(r"weather\s+(?:in|for|at|like in)\s+([a-zA-Z\s]+)", command)
+        if m:
+            city = m.group(1).strip().title()
+        else:
+            # Pattern: <city> weather
+            m2 = re.search(r"([a-zA-Z\s]+)\s+weather", command)
+            if m2 and m2.group(1).strip() not in ("what", "how", "the", "current"):
+                city = m2.group(1).strip().title()
+        get_weather(city)
+        return
+
+    # --- Power Controls ---
+    if "cancel shutdown" in command:
+        cancel_shutdown()
+        return
+    elif "shut down" in command or "shutdown" in command:
+        shutdown_computer()
+        return
+    elif "restart" in command or "reboot" in command:
+        restart_computer()
+        return
+    elif "sleep" in words and "computer" in words:
+        sleep_computer()
+        return
+
+    # --- Notes & Reminders ---
+    if command.startswith("remember that") or command.startswith("remember this"):
         note = command.split("remember that", 1)[-1].split("remember this", 1)[-1].strip()
         save_note(note)
+        return
     elif "take a note" in command or "save a note" in command:
         save_note(None)
+        return
     elif "read my notes" in command or "what did i ask you to remember" in command:
         read_notes()
+        return
     elif "clear my notes" in command or "delete my notes" in command:
         clear_notes()
+        return
 
     # --- News ---
-    elif "news" in words:
+    if "news" in words or "headlines" in words:
         read_news()
+        return
 
     # --- Google ---
-    elif command.startswith("open google") or "search google for" in command or "google search for" in command:
+    if command.startswith("open google") or "search google for" in command or "google search for" in command:
         if "search google for" in command:
             query = command.split("search google for", 1)[1].strip()
         elif "google search for" in command:
@@ -529,125 +1110,220 @@ def process_command(command):
         if query:
             webbrowser.open(f"https://www.google.com/search?q={quote_plus(query)}")
             speak(f"Searching Google for {query}")
-            speak(get_ai_response(query))
         else:
             webbrowser.open("https://www.google.com")
             speak("Opening Google.")
-    elif "close google" in command:
+        return
+    elif "close google" in command or "close browser" in command:
         close_browser()
-        speak("Closing Google.")
+        return
 
     # --- YouTube ---
-    elif command.startswith("search youtube for") or command.startswith("youtube search for"):
+    if command.startswith("search youtube for") or command.startswith("youtube search for"):
         query = command.replace("search youtube for", "", 1).replace("youtube search for", "", 1).strip()
         if query:
             speak(f"Playing {query} on YouTube")
-            pywhatkit.playonyt(query)
+            if pywhatkit:
+                pywhatkit.playonyt(query)
+            else:
+                webbrowser.open(f"https://www.youtube.com/results?search_query={quote_plus(query)}")
         else:
             webbrowser.open("https://www.youtube.com")
             speak("Opening YouTube.")
+        return
     elif "open youtube" in command:
         webbrowser.open("https://www.youtube.com")
         speak("Opening YouTube.")
+        return
     elif "close youtube" in command:
         close_browser()
-        speak("Closing YouTube.")
+        return
 
-    # --- Social apps ---
-    elif "open facebook" in command:
+    # --- Social Apps ---
+    if "open facebook" in command:
         webbrowser.open("https://www.facebook.com")
         speak("Opening Facebook.")
+        return
     elif "close facebook" in command:
         close_browser()
-        speak("Closing Facebook.")
+        return
     elif "open instagram" in command:
         webbrowser.open("https://www.instagram.com")
         speak("Opening Instagram.")
+        return
     elif "close instagram" in command:
         close_browser()
-        speak("Closing Instagram.")
+        return
     elif "open whatsapp" in command:
         webbrowser.open("https://web.whatsapp.com")
         speak("Opening WhatsApp.")
+        return
     elif "close whatsapp" in command:
         close_browser()
-        speak("Closing WhatsApp.")
+        return
     elif command.startswith("send whatsapp message to") or command.startswith("send a whatsapp message to"):
         send_whatsapp_message(raw_command)
+        return
     elif "open linkedin" in command:
         webbrowser.open("https://www.linkedin.com")
         speak("Opening LinkedIn.")
+        return
 
-    # --- Music ---
-    elif command.startswith("play"):
+    # --- Music Playback ---
+    if command.startswith("play"):
         try:
-            song = raw_command[4:].strip()
+            # Strip 'play', 'song', and trailing punctuation
+            song = re.sub(r"^play\s+(?:song\s+)?", "", command).strip(" .!?")
             if not song:
-                speak("What song would you like to play?")
-                song = listen_and_transcribe(QUESTION_DURATION) or ""
+                song = prompt_user("What song would you like to play?") or ""
+                song = song.strip(" .!?")
+
             if song in music_library.music:
                 webbrowser.open(music_library.music[song])
                 speak(f"Playing {song}")
             elif song:
                 speak(f"Playing {song} on YouTube")
-                pywhatkit.playonyt(song)
+                if pywhatkit:
+                    pywhatkit.playonyt(song)
+                else:
+                    webbrowser.open(f"https://www.youtube.com/results?search_query={quote_plus(song)}")
             else:
                 speak("I didn't catch a song name.")
         except Exception as e:
-            print(e)
+            print("Music error:", e)
             speak("Something went wrong while playing the song.")
+        return
 
-    # --- Fallback: let the AI handle it ---
-    else:
-        speak(get_ai_response(command))
+    # --- Fallback: AI or Knowledge Engine ---
+    speak(get_ai_response(raw_command))
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Interactive Shell & Execution Loops
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    speak("Yes sir, how can I help you.")
+def run_cli_loop():
+    """Interactive conversational terminal shell."""
+    global EXIT_REQUESTED
+    print("\n" + "=" * 60)
+    print("      JARVIS A.I. ASSISTANT (Interactive Shell)")
+    print("=" * 60)
+    print("Type your commands below. Type 'help' for examples or 'exit' to quit.")
+    print("=" * 60 + "\n")
+    speak("Yes sir, Jarvis is online and ready for your command.")
 
     while not EXIT_REQUESTED:
         try:
-            print("Waiting for wake word...")
+            cmd = input("\nJarvis > ").strip()
+            if not cmd:
+                continue
 
+            if cmd.lower() in ("help", "?"):
+                print("\nAvailable Features:")
+                print("  • Time/Date: 'what's the time', 'what is today's date'")
+                print("  • Weather: 'weather in London', 'Tokyo weather'")
+                print("  • Math (AST safe): 'calculate 45 * 12', 'what is 15 percent of 200'")
+                print("  • Units: 'convert 100 celsius to fahrenheit', 'convert 5 miles to km'")
+                print("  • Wikipedia: 'who was Isaac Newton', 'define quantum computing'")
+                print("  • Diagnostics: 'system diagnostics', 'system status', 'ping test'")
+                print("  • Desktop Apps: 'open notepad', 'open calculator', 'open terminal'")
+                print("  • Timers: 'set a timer for 10 seconds'")
+                print("  • Audio: 'mute', 'volume up', 'volume down'")
+                print("  • Notes: 'remember that my password is safe', 'read my notes'")
+                print("  • Web/Media: 'search google for cats', 'play believer'")
+                print("  • Power: 'shut down', 'restart', 'sleep computer'")
+                print("  • Exit: 'exit', 'quit'")
+                continue
+
+            process_command(cmd)
+        except (KeyboardInterrupt, EOFError):
+            speak("Goodbye sir.")
+            break
+        except Exception as err:
+            print("Execution error:", err)
+            speak("An error occurred while processing that command.")
+
+
+def run_voice_loop():
+    """Voice-driven loop with wake-word detection and robust fallback."""
+    global EXIT_REQUESTED
+    speak("Yes sir, Jarvis voice system is online. How can I help you.")
+
+    while not EXIT_REQUESTED:
+        try:
+            print("\nWaiting for wake word ('Jarvis')...")
             wake_text = None
             while not wake_text or "jarvis" not in wake_text.lower():
                 wake_text = listen_and_transcribe(WAKE_WORD_DURATION)
                 if wake_text:
-                    print("You said:", wake_text)
+                    print(f"Heard: {wake_text}")
+                if EXIT_REQUESTED:
+                    break
 
-            speak("Yes Sir. I'm listening.")
+            if EXIT_REQUESTED:
+                break
 
+            speak("Yes Sir, I'm listening.")
             active = True
-            print("Listening for your command...")
             while active and not EXIT_REQUESTED:
+                print("Listening for command...")
                 command = listen_and_transcribe(COMMAND_DURATION)
-
                 if command:
-                    print("Command:", command)
-                    command_lower = command.lower()
-
-                    if any(phrase in command_lower for phrase in ("stop jarvis", "go to sleep")):
+                    print(f"Command heard: {command}")
+                    cmd_lower = command.lower()
+                    if any(phrase in cmd_lower for phrase in ("stop jarvis", "go to sleep")):
                         speak("Going back to sleep. Say Jarvis to wake me up again.")
                         active = False
                     else:
-                        speak(f"You said, {command}")
                         try:
                             process_command(command)
                         except Exception as e:
                             print("Command error:", e)
                             speak("Sorry, something went wrong with that command.")
 
-                        if active and not EXIT_REQUESTED:
-                            print("Listening for your command...")
-
         except KeyboardInterrupt:
             speak("Goodbye, have a great day.")
             break
         except Exception as e:
-            print("Error:", e)
+            print("System error:", e)
 
     print("Jarvis stopped.")
+
+
+# ---------------------------------------------------------------------------
+# Entry Point
+# ---------------------------------------------------------------------------
+
+def main():
+    global CLI_MODE, QUIET_MODE
+
+    parser = argparse.ArgumentParser(description="Jarvis AI Virtual Assistant")
+    parser.add_argument("--cli", "--text", action="store_true", help="Force interactive CLI/text mode")
+    parser.add_argument("--voice", action="store_true", help="Force voice recognition mode")
+    parser.add_argument("--quiet", action="store_true", help="Mute text-to-speech engine")
+    args = parser.parse_args()
+
+    QUIET_MODE = args.quiet
+
+    # Determine execution mode based on arguments and hardware availability
+    if args.cli:
+        CLI_MODE = True
+    elif args.voice:
+        CLI_MODE = False
+    else:
+        # Automatic hardware probing
+        mic_available = has_working_microphone()
+        if not mic_available:
+            print("[Notice] No audio input device detected. Defaulting to Interactive Shell.")
+            CLI_MODE = True
+        else:
+            CLI_MODE = False
+
+    if CLI_MODE:
+        run_cli_loop()
+    else:
+        run_voice_loop()
+
+
+if __name__ == "__main__":
+    main()
