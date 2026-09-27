@@ -6,13 +6,26 @@ Architecture:
     Interactive Conversational CLI mode (auto-selected if mic is missing or via --cli).
   - Safety & Security: Zero-eval math engine, confirmed power controls, sanitized
     notes with automated backups, graceful process controls.
-  - Multi-Modal Knowledge: Offline Wikipedia summarizer + OpenAI conversational fallback.
+  - Multi-Modal Knowledge: Offline Wikipedia summarizer + OpenAI conversational fallback
+    (works standalone, or via an optional external client.py module).
   - Advanced Diagnostics: Battery/CPU/RAM, disk health, top memory consumers, network ping.
   - Productivity: Non-blocking asynchronous timers, desktop app launcher, system audio controls.
+
+New in this version (combined from two prior prototypes + original additions):
+  - Unique Feature 7: Persistent, wall-clock Scheduled Reminders ("remind me to X at 5pm" /
+    "...in 20 minutes") that survive restarts and are checked by a background thread.
+  - Unique Feature 8: Custom Voice Routines/Macros — chain multiple commands under one name
+    ("create routine morning: what's the time, weather in Kathmandu, news") and replay them
+    with "run routine morning".
+  - Unique Feature 9: Context-aware AI fallback — keeps a short rolling conversation history
+    so follow-up questions to the AI assistant make sense without repeating context.
+  - Unique Feature 10: Dual TTS backend — offline pyttsx3 (default) or online gTTS+pygame,
+    selectable with --tts-backend, with automatic fallback if one is unavailable.
 """
 
 import argparse
 import ast
+import json
 import math
 import operator
 import os
@@ -21,13 +34,13 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote_plus
 
-import numpy as np
 import requests
 
 # ---------------------------------------------------------------------------
@@ -38,10 +51,82 @@ try:
     from client import ask_openai, get_openai_client, is_openai_configured, load_env_file
     load_env_file()
 except ImportError:
-    def load_env_file(): pass
-    def is_openai_configured(): return bool(os.getenv("OPENAI_API_KEY", "").strip())
-    def get_openai_client(): return None
-    def ask_openai(p): return "OpenAI client helper is not available."
+    def load_env_file():
+        """Minimal .env loader so OPENAI_API_KEY etc. work without python-dotenv."""
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        if not os.path.exists(env_path):
+            return
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, value = line.partition("=")
+                    os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        except Exception:
+            pass
+
+    load_env_file()
+
+    def is_openai_configured():
+        return bool(os.getenv("OPENAI_API_KEY", "").strip())
+
+    try:
+        from openai import OpenAI as _OpenAIClient
+    except ImportError:
+        _OpenAIClient = None
+
+    def get_openai_client():
+        if _OpenAIClient is None:
+            return None
+        key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not key:
+            return None
+        try:
+            return _OpenAIClient(api_key=key)
+        except Exception:
+            return None
+
+    def ask_openai(prompt):
+        client = get_openai_client()
+        if client is None:
+            return "OpenAI client helper is not available."
+        try:
+            completion = client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=[
+                    {"role": "system", "content": "You are Jarvis, a concise, helpful virtual assistant."},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            return completion.choices[0].message.content
+        except Exception as err:
+            return f"Sorry, I couldn't reach OpenAI: {err}"
+
+    def ask_openai_with_context(history):
+        """Context-aware variant used by the conversational memory feature."""
+        client = get_openai_client()
+        if client is None:
+            return ask_openai(history[-1]["content"]) if history else "I don't have anything to respond to."
+        try:
+            messages = [
+                {"role": "system", "content": "You are Jarvis, a concise, helpful virtual assistant. "
+                                               "Use the prior conversation for context when relevant."}
+            ] + history
+            completion = client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=messages,
+            )
+            return completion.choices[0].message.content
+        except Exception as err:
+            return f"Sorry, I couldn't reach OpenAI: {err}"
+else:
+    def ask_openai_with_context(history):
+        """Fall back to the single-turn helper if only an external client.py is available."""
+        if not history:
+            return "I don't have anything to respond to."
+        return ask_openai(history[-1]["content"])
 
 try:
     import sounddevice as sd
@@ -57,6 +142,16 @@ try:
     import pyttsx3
 except ModuleNotFoundError:
     pyttsx3 = None
+
+try:
+    from gtts import gTTS
+except ModuleNotFoundError:
+    gTTS = None
+
+try:
+    import pygame
+except ModuleNotFoundError:
+    pygame = None
 
 try:
     import pywhatkit
@@ -77,9 +172,12 @@ try:
     import importlib
     music_library = importlib.import_module("musiclibrary")
 except ModuleNotFoundError:
-    class _MusicLibrary:
-        music = {}
-    music_library = _MusicLibrary()
+    try:
+        music_library = importlib.import_module("musicLibrary")
+    except ModuleNotFoundError:
+        class _MusicLibrary:
+            music = {}
+        music_library = _MusicLibrary()
 
 
 # ---------------------------------------------------------------------------
@@ -96,12 +194,22 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
-NOTES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_notes.txt")
-NOTES_BACKUP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_notes.bak")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+NOTES_FILE = os.path.join(BASE_DIR, "jarvis_notes.txt")
+NOTES_BACKUP = os.path.join(BASE_DIR, "jarvis_notes.bak")
+REMINDERS_FILE = os.path.join(BASE_DIR, "jarvis_reminders.json")
+ROUTINES_FILE = os.path.join(BASE_DIR, "jarvis_routines.json")
 
 EXIT_REQUESTED = False
 CLI_MODE = False
 QUIET_MODE = False
+TTS_BACKEND = "pyttsx3"  # or "gtts"
+
+# Rolling conversational memory for context-aware AI fallback answers.
+CONVO_HISTORY = []
+CONVO_HISTORY_MAX_TURNS = 6  # keeps last 6 user+assistant exchanges
+
+_reminders_lock = threading.Lock()
 
 # Speech synthesis engine initialization (safely guarded)
 _tts_engine = None
@@ -129,8 +237,26 @@ if recognizer:
 # Core Audio & I/O Helpers
 # ---------------------------------------------------------------------------
 
+def _speak_gtts(text):
+    """Online TTS backend using gTTS + pygame (mirrors the lightweight prototype)."""
+    tmp_path = os.path.join(tempfile.gettempdir(), f"jarvis_tts_{int(time.time() * 1000)}.mp3")
+    tts = gTTS(text)
+    tts.save(tmp_path)
+
+    pygame.mixer.init()
+    pygame.mixer.music.load(tmp_path)
+    pygame.mixer.music.play()
+    while pygame.mixer.music.get_busy():
+        pygame.time.Clock().tick(10)
+    pygame.mixer.music.unload()
+    try:
+        os.remove(tmp_path)
+    except OSError:
+        pass
+
+
 def speak(text):
-    """Output speech audio safely and print to console."""
+    """Output speech audio safely and print to console. Backend chosen by TTS_BACKEND."""
     if not text:
         return
     text = str(text).strip()
@@ -138,6 +264,13 @@ def speak(text):
 
     if QUIET_MODE:
         return
+
+    if TTS_BACKEND == "gtts" and gTTS is not None and pygame is not None:
+        try:
+            _speak_gtts(text)
+            return
+        except Exception as err:
+            print(f"[gTTS Error]: {err} — falling back to offline TTS.")
 
     engine = get_tts_engine()
     if engine is None:
@@ -226,12 +359,9 @@ def prompt_user(prompt_text, duration=COMMAND_DURATION):
     else:
         ans = listen_and_transcribe(duration)
         if not ans:
-            # Fallback to text prompt if speech wasn't heard
             try:
-                print(f"(Microphone timed out. Type response or press Enter to skip)")
-                import select
-                # On Windows select doesn't work on stdin, use standard fallback
-                ans = input(f"> ").strip()
+                print("(Microphone timed out. Type response or press Enter to skip)")
+                ans = input("> ").strip()
             except Exception:
                 ans = None
         return ans
@@ -326,7 +456,6 @@ def sleep_computer():
     if system == "Windows":
         try:
             import ctypes
-            # Put computer to true sleep (suspend state 0, not hibernate)
             ctypes.windll.PowrProf.SetSuspendState(0, 1, 0)
         except Exception:
             _run_power_command({"Windows": ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"]}, "sleep")
@@ -357,7 +486,6 @@ def ask_wikipedia(query):
         return False
 
     try:
-        # Search for page
         search_results = wikipedia.search(clean_query)
         if not search_results:
             speak(f"I couldn't find any Wikipedia article about {clean_query}.")
@@ -417,7 +545,7 @@ SAFE_FUNCTIONS = {
 def _eval_ast_node(node):
     if isinstance(node, ast.Expression):
         return _eval_ast_node(node.body)
-    elif isinstance(node, ast.Constant):  # Python 3.8+
+    elif isinstance(node, ast.Constant):
         if isinstance(node.value, (int, float)):
             return node.value
         raise ValueError(f"Unsafe constant type: {type(node.value)}")
@@ -445,12 +573,10 @@ def _eval_ast_node(node):
 
 def calculate_expression(expression_str):
     """Safely calculate mathematical expression without using eval()."""
-    # Clean expression
     cleaned = expression_str.lower().strip()
     for word in ("calculate", "what is", "how much is", "solve", "equals", "="):
         cleaned = cleaned.replace(word, " ")
 
-    # Replace verbal math operators with symbols
     cleaned = cleaned.replace("times", "*").replace("multiplied by", "*").replace("x", "*")
     cleaned = cleaned.replace("divided by", "/").replace("over", "/")
     cleaned = cleaned.replace("plus", "+").replace("add", "+")
@@ -458,7 +584,6 @@ def calculate_expression(expression_str):
     cleaned = cleaned.replace("to the power of", "**").replace("power of", "**").replace("^", "**")
     cleaned = cleaned.replace("percent of", "* 0.01 *")
 
-    # Keep only safe characters
     cleaned = re.sub(r"[^0-9\+\-\*\/\.\(\)\s\%\^a-z_]", "", cleaned).strip()
     if not cleaned:
         speak("I couldn't find a valid mathematical expression to calculate.")
@@ -474,28 +599,26 @@ def calculate_expression(expression_str):
         speak(f"The result is {result}")
     except ZeroDivisionError:
         speak("Cannot divide by zero.")
-    except Exception as err:
+    except Exception:
         speak("Sorry, I could not calculate that expression safely.")
 
 
 def convert_units(command):
     """Convert common physical units (temperature, distance, weight)."""
-    # Temperature: Celsius <-> Fahrenheit
     c_to_f = re.search(r"(\-?\d+(?:\.\d+)?)\s*(?:degrees?)?\s*celsius\s+(?:in|to)\s+fahrenheit", command)
     if c_to_f:
         c = float(c_to_f.group(1))
-        f = round((c * 9/5) + 32, 2)
+        f = round((c * 9 / 5) + 32, 2)
         speak(f"{c} degrees Celsius is {f} degrees Fahrenheit.")
         return True
 
     f_to_c = re.search(r"(\-?\d+(?:\.\d+)?)\s*(?:degrees?)?\s*fahrenheit\s+(?:in|to)\s+celsius", command)
     if f_to_c:
         f = float(f_to_c.group(1))
-        c = round((f - 32) * 5/9, 2)
+        c = round((f - 32) * 5 / 9, 2)
         speak(f"{f} degrees Fahrenheit is {c} degrees Celsius.")
         return True
 
-    # Distance: Kilometers <-> Miles
     km_to_mi = re.search(r"(\d+(?:\.\d+)?)\s*(?:kilometers?|km)\s+(?:in|to)\s+miles?", command)
     if km_to_mi:
         km = float(km_to_mi.group(1))
@@ -510,7 +633,6 @@ def convert_units(command):
         speak(f"{mi} miles is approximately {km} kilometers.")
         return True
 
-    # Weight: Kilograms <-> Pounds
     kg_to_lb = re.search(r"(\d+(?:\.\d+)?)\s*(?:kilograms?|kg)\s+(?:in|to)\s*(?:pounds?|lbs?)", command)
     if kg_to_lb:
         kg = float(kg_to_lb.group(1))
@@ -533,12 +655,10 @@ def convert_units(command):
 # ---------------------------------------------------------------------------
 
 def system_status():
-    """Report CPU, RAM, and battery state without 1-second lag."""
     if not psutil:
         speak("I need the psutil package installed to check system status.")
         return
 
-    # Non-blocking CPU reading
     cpu = psutil.cpu_percent(interval=0.1)
     mem = psutil.virtual_memory()
     parts = [f"CPU usage is at {cpu} percent", f"RAM usage is at {mem.percent} percent"]
@@ -552,23 +672,20 @@ def system_status():
 
 
 def system_diagnostics():
-    """Deep system diagnostics: Disk storage, top memory process, and network ping."""
     if not psutil:
         speak("System diagnostics require the psutil package.")
         return
 
     parts = []
-    # Disk usage
     try:
         root_path = "C:\\" if platform.system() == "Windows" else "/"
         disk = psutil.disk_usage(root_path)
-        free_gb = round(disk.free / (1024**3), 1)
-        total_gb = round(disk.total / (1024**3), 1)
+        free_gb = round(disk.free / (1024 ** 3), 1)
+        total_gb = round(disk.total / (1024 ** 3), 1)
         parts.append(f"Primary storage has {free_gb} gigabytes free out of {total_gb} gigabytes")
     except Exception:
         pass
 
-    # Top memory consumer
     try:
         top_procs = sorted(
             psutil.process_iter(['name', 'memory_info']),
@@ -590,7 +707,6 @@ def system_diagnostics():
 
 
 def ping_network(host="8.8.8.8"):
-    """Check internet connectivity and latency."""
     system = platform.system()
     param = "-n" if system == "Windows" else "-c"
     cmd = ["ping", param, "1", host]
@@ -624,7 +740,6 @@ APP_COMMANDS = {
 
 
 def launch_application(app_name):
-    """Safely launch common desktop applications."""
     app_key = app_name.lower().strip()
     cmd = APP_COMMANDS.get(app_key)
     if not cmd:
@@ -655,7 +770,6 @@ _active_timers = []
 
 
 def set_timer(seconds, label="timer"):
-    """Start an asynchronous background timer that speaks when finished."""
     def _timer_worker():
         time.sleep(seconds)
         speak(f"Ding ding! Time's up! Your {label} for {seconds} seconds is complete.")
@@ -669,7 +783,6 @@ def set_timer(seconds, label="timer"):
 
 
 def parse_and_set_timer(command):
-    """Parse timer durations like 'timer for 5 minutes' or 'timer for 30 seconds'."""
     match = re.search(r"(\d+)\s*(second|minute|hour)s?", command)
     if not match:
         speak("How many seconds or minutes should I set the timer for?")
@@ -693,12 +806,10 @@ def parse_and_set_timer(command):
 # ---------------------------------------------------------------------------
 
 def control_volume(action):
-    """Cross-platform system volume adjustment."""
     system = platform.system()
     try:
         if system == "Windows":
             import ctypes
-            # VK_VOLUME_MUTE = 0xAD, VK_VOLUME_DOWN = 0xAE, VK_VOLUME_UP = 0xAF
             if action == "mute" or action == "unmute":
                 ctypes.windll.user32.keybd_event(0xAD, 0, 0, 0)
                 ctypes.windll.user32.keybd_event(0xAD, 0, 2, 0)
@@ -820,7 +931,6 @@ def save_note(text):
             speak("I didn't catch that, so I didn't save anything.")
             return
 
-    # Sanitize note (single line, no control chars)
     sanitized = " ".join(text.split()).strip()
     if not sanitized:
         speak("Note was empty.")
@@ -878,6 +988,162 @@ def clear_notes():
 
 
 # ---------------------------------------------------------------------------
+# Unique Feature 7: Persistent Scheduled Reminders (survive restarts)
+# ---------------------------------------------------------------------------
+
+def _load_json(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _save_json(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as err:
+        print("Save JSON error:", err)
+
+
+def parse_reminder_time(text):
+    """Parse phrases like 'at 5pm', 'at 17:30', 'in 10 minutes', 'in 2 hours'."""
+    now = datetime.now()
+    text = text.strip().lower()
+
+    m = re.search(r"in\s+(\d+)\s*(minute|hour)s?", text)
+    if m:
+        amount = int(m.group(1))
+        unit = m.group(2)
+        delta_seconds = amount * (3600 if unit == "hour" else 60)
+        return now + timedelta(seconds=delta_seconds)
+
+    m2 = re.search(r"at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", text)
+    if m2:
+        hour = int(m2.group(1))
+        minute = int(m2.group(2)) if m2.group(2) else 0
+        ampm = m2.group(3)
+        if ampm == "pm" and hour != 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return None
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        return target
+
+    return None
+
+
+def add_reminder(command):
+    """Handles: 'remind me to <task> at <time>' / 'remind me to <task> in <duration>'."""
+    m = re.search(r"remind me to (.+?)\s+(at|in)\s+(.+)", command, re.IGNORECASE)
+    if not m:
+        speak("Please say it like: remind me to call mom at 5 PM, or remind me to take a break in 20 minutes.")
+        return False
+
+    task = m.group(1).strip()
+    time_phrase = f"{m.group(2)} {m.group(3)}".strip()
+    when = parse_reminder_time(time_phrase)
+    if not when:
+        speak("I couldn't understand that time. Try 'at 5pm' or 'in 20 minutes'.")
+        return False
+
+    with _reminders_lock:
+        reminders = _load_json(REMINDERS_FILE, [])
+        reminders.append({"task": task, "time": when.isoformat(), "done": False})
+        _save_json(REMINDERS_FILE, reminders)
+
+    speak(f"Okay, I'll remind you to {task} at {when.strftime('%I:%M %p on %B %d').lstrip('0')}.")
+    return True
+
+
+def list_reminders():
+    reminders = _load_json(REMINDERS_FILE, [])
+    pending = [r for r in reminders if not r.get("done")]
+    if not pending:
+        speak("You have no upcoming reminders.")
+        return
+    speak(f"You have {len(pending)} upcoming reminder{'s' if len(pending) != 1 else ''}.")
+    for r in pending[:5]:
+        when = datetime.fromisoformat(r["time"])
+        speak(f"{r['task']} at {when.strftime('%I:%M %p').lstrip('0')}")
+
+
+def reminder_checker_loop():
+    """Background daemon thread: checks reminders periodically and announces due ones."""
+    while not EXIT_REQUESTED:
+        try:
+            with _reminders_lock:
+                reminders = _load_json(REMINDERS_FILE, [])
+                now = datetime.now()
+                changed = False
+                for r in reminders:
+                    if not r.get("done"):
+                        when = datetime.fromisoformat(r["time"])
+                        if now >= when:
+                            speak(f"Reminder: {r['task']}")
+                            r["done"] = True
+                            changed = True
+                if changed:
+                    _save_json(REMINDERS_FILE, reminders)
+        except Exception as err:
+            print("Reminder checker error:", err)
+        time.sleep(20)
+
+
+# ---------------------------------------------------------------------------
+# Unique Feature 8: Custom Voice Routines / Macros
+# ---------------------------------------------------------------------------
+
+def create_routine(command):
+    """Handles: 'create routine <name>: <step1>, <step2>, ...'"""
+    m = re.search(r"create routine (\w+)\s*:\s*(.+)", command, re.IGNORECASE)
+    if not m:
+        speak("Say it like: create routine morning: what's the time, weather in Kathmandu, news.")
+        return False
+
+    name = m.group(1).strip().lower()
+    steps = [s.strip() for s in m.group(2).strip().split(",") if s.strip()]
+    if not steps:
+        speak("I need at least one step for the routine.")
+        return False
+
+    routines = _load_json(ROUTINES_FILE, {})
+    routines[name] = steps
+    _save_json(ROUTINES_FILE, routines)
+    speak(f"Routine '{name}' saved with {len(steps)} steps.")
+    return True
+
+
+def run_routine(name):
+    routines = _load_json(ROUTINES_FILE, {})
+    name = name.strip().lower()
+    steps = routines.get(name)
+    if not steps:
+        speak(f"I don't have a routine called {name}.")
+        return False
+
+    speak(f"Running routine {name}.")
+    for step in steps:
+        process_command(step)
+    return True
+
+
+def list_routines():
+    routines = _load_json(ROUTINES_FILE, {})
+    if not routines:
+        speak("You don't have any saved routines.")
+        return
+    speak(f"You have {len(routines)} routines: {', '.join(routines.keys())}.")
+
+
+# ---------------------------------------------------------------------------
 # Social & WhatsApp Messaging
 # ---------------------------------------------------------------------------
 
@@ -896,7 +1162,6 @@ def send_whatsapp_message(command):
         return
 
     phone, message = (part.strip() for part in remainder.split(separator, 1))
-    # Normalize phone number (strip spaces, dashes, parentheses)
     clean_phone = re.sub(r"[^\d\+]", "", phone).lstrip("+")
     if not clean_phone or not clean_phone.isdigit() or not message:
         speak("I need a valid phone number and a message.")
@@ -938,15 +1203,25 @@ def read_news():
 
 
 # ---------------------------------------------------------------------------
-# AI Fallback
+# Unique Feature 9: Context-Aware AI Fallback
 # ---------------------------------------------------------------------------
 
 def get_ai_response(prompt):
-    """Query OpenAI if configured; otherwise use Wikipedia fallback."""
-    if is_openai_configured():
-        return ask_openai(prompt)
+    """Query OpenAI (with rolling conversational memory) if configured;
+    otherwise fall back to Wikipedia for informative answers."""
+    global CONVO_HISTORY
 
-    # If OpenAI is not configured, try Wikipedia for informative answers
+    if is_openai_configured():
+        CONVO_HISTORY.append({"role": "user", "content": prompt})
+        CONVO_HISTORY[:] = CONVO_HISTORY[-CONVO_HISTORY_MAX_TURNS * 2:]
+        try:
+            response = ask_openai_with_context(CONVO_HISTORY)
+        except NameError:
+            response = ask_openai(prompt)
+        CONVO_HISTORY.append({"role": "assistant", "content": response})
+        CONVO_HISTORY[:] = CONVO_HISTORY[-CONVO_HISTORY_MAX_TURNS * 2:]
+        return response
+
     if wikipedia:
         search_res = wikipedia.search(prompt)
         if search_res:
@@ -978,7 +1253,7 @@ def process_command(raw_command):
         speak("Goodbye sir. Have a wonderful day.")
         return
 
-    # --- Sleep & Volume ---
+    # --- Volume ---
     if any(phrase in command for phrase in ("mute audio", "mute sound", "mute")):
         control_volume("mute")
         return
@@ -990,6 +1265,26 @@ def process_command(raw_command):
         return
     elif any(phrase in command for phrase in ("volume down", "decrease volume", "lower volume", "quieter")):
         control_volume("down")
+        return
+
+    # --- Reminders (must come before generic "timer"/"remember" checks) ---
+    if command.startswith("remind me to"):
+        add_reminder(raw_command)
+        return
+    elif "list reminders" in command or "my reminders" in command or "upcoming reminders" in command:
+        list_reminders()
+        return
+
+    # --- Routines ---
+    if command.startswith("create routine"):
+        create_routine(raw_command)
+        return
+    elif command.startswith("run routine"):
+        name = command.replace("run routine", "", 1).strip()
+        run_routine(name)
+        return
+    elif "list routines" in command or "my routines" in command:
+        list_routines()
         return
 
     # --- Timers ---
@@ -1052,12 +1347,10 @@ def process_command(raw_command):
     # --- Weather ---
     if "weather" in command:
         city = None
-        # Pattern: weather in <city>, weather for <city>, weather at <city>
         m = re.search(r"weather\s+(?:in|for|at|like in)\s+([a-zA-Z\s]+)", command)
         if m:
             city = m.group(1).strip().title()
         else:
-            # Pattern: <city> weather
             m2 = re.search(r"([a-zA-Z\s]+)\s+weather", command)
             if m2 and m2.group(1).strip() not in ("what", "how", "the", "current"):
                 city = m2.group(1).strip().title()
@@ -1078,7 +1371,7 @@ def process_command(raw_command):
         sleep_computer()
         return
 
-    # --- Notes & Reminders ---
+    # --- Notes ---
     if command.startswith("remember that") or command.startswith("remember this"):
         note = command.split("remember that", 1)[-1].split("remember this", 1)[-1].strip()
         save_note(note)
@@ -1172,7 +1465,6 @@ def process_command(raw_command):
     # --- Music Playback ---
     if command.startswith("play"):
         try:
-            # Strip 'play', 'song', and trailing punctuation
             song = re.sub(r"^play\s+(?:song\s+)?", "", command).strip(" .!?")
             if not song:
                 song = prompt_user("What song would you like to play?") or ""
@@ -1228,6 +1520,9 @@ def run_cli_loop():
                 print("  • Diagnostics: 'system diagnostics', 'system status', 'ping test'")
                 print("  • Desktop Apps: 'open notepad', 'open calculator', 'open terminal'")
                 print("  • Timers: 'set a timer for 10 seconds'")
+                print("  • Reminders: 'remind me to call mom at 5pm', 'list reminders'")
+                print("  • Routines: 'create routine morning: what's the time, weather in Kathmandu, news'")
+                print("              'run routine morning', 'list routines'")
                 print("  • Audio: 'mute', 'volume up', 'volume down'")
                 print("  • Notes: 'remember that my password is safe', 'read my notes'")
                 print("  • Web/Media: 'search google for cats', 'play believer'")
@@ -1295,29 +1590,36 @@ def run_voice_loop():
 # ---------------------------------------------------------------------------
 
 def main():
-    global CLI_MODE, QUIET_MODE
+    global CLI_MODE, QUIET_MODE, TTS_BACKEND
 
     parser = argparse.ArgumentParser(description="Jarvis AI Virtual Assistant")
     parser.add_argument("--cli", "--text", action="store_true", help="Force interactive CLI/text mode")
     parser.add_argument("--voice", action="store_true", help="Force voice recognition mode")
     parser.add_argument("--quiet", action="store_true", help="Mute text-to-speech engine")
+    parser.add_argument(
+        "--tts-backend", choices=["pyttsx3", "gtts"],
+        default=os.getenv("JARVIS_TTS_BACKEND", "pyttsx3"),
+        help="Choose offline (pyttsx3) or online (gTTS) text-to-speech backend"
+    )
     args = parser.parse_args()
 
     QUIET_MODE = args.quiet
+    TTS_BACKEND = args.tts_backend
 
-    # Determine execution mode based on arguments and hardware availability
     if args.cli:
         CLI_MODE = True
     elif args.voice:
         CLI_MODE = False
     else:
-        # Automatic hardware probing
         mic_available = has_working_microphone()
         if not mic_available:
             print("[Notice] No audio input device detected. Defaulting to Interactive Shell.")
             CLI_MODE = True
         else:
             CLI_MODE = False
+
+    # Background reminder checker runs regardless of CLI/voice mode.
+    threading.Thread(target=reminder_checker_loop, daemon=True).start()
 
     if CLI_MODE:
         run_cli_loop()
