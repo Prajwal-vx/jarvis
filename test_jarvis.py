@@ -70,6 +70,37 @@ class TestSafeMathEvaluator(unittest.TestCase):
                 # Statements like 'import os' cannot even be parsed in eval mode
                 pass
 
+    def test_expensive_math_is_rejected(self):
+        tree = ast.parse("10 ** 100000000", mode="eval")
+        with self.assertRaises(ValueError):
+            main._eval_ast_node(tree)
+
+        with patch("main.speak") as mock_speak:
+            main.calculate_expression("1" * (main.MAX_MATH_EXPRESSION_LENGTH + 1))
+        mock_speak.assert_called_once_with("That expression is too long to calculate safely.")
+
+    def test_boolean_and_keyword_arguments_are_rejected(self):
+        for expression in ("True", "round(1.2, ndigits=1)"):
+            tree = ast.parse(expression, mode="eval")
+            with self.assertRaises(ValueError):
+                main._validate_math_tree(tree)
+
+
+class TestDestructiveActionConfirmation(unittest.TestCase):
+    @patch("main._run_power_command")
+    @patch("main.prompt_user", return_value="yesterday")
+    @patch("main.speak")
+    def test_substring_yes_does_not_confirm_shutdown(self, _speak, _prompt, run_power):
+        main.shutdown_computer()
+        run_power.assert_not_called()
+
+    @patch("main._run_power_command")
+    @patch("main.prompt_user", return_value=" YES ")
+    @patch("main.speak")
+    def test_exact_yes_confirms_shutdown(self, _speak, _prompt, run_power):
+        main.shutdown_computer()
+        run_power.assert_called_once()
+
 
 class TestUnitConverter(unittest.TestCase):
     """Test unit conversions for temperature, distance, and mass."""

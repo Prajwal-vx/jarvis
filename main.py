@@ -155,7 +155,9 @@ except ModuleNotFoundError:
 
 try:
     import pywhatkit
-except ModuleNotFoundError:
+except Exception:
+    # Some pywhatkit releases perform a network check during import. Keep the
+    # assistant usable offline when that optional check or dependency fails.
     pywhatkit = None
 
 try:
@@ -376,7 +378,7 @@ def close_browser():
     system = platform.system()
     speak("Closing the browser will close all active tabs and unsaved work. Are you sure? Say or type yes to confirm.")
     reply = prompt_user("Confirm browser close (yes/no):", COMMAND_DURATION) or ""
-    if "yes" not in reply.lower():
+    if reply.strip().lower() != "yes":
         speak("Cancelled. Your browser was left open.")
         return False
 
@@ -411,7 +413,7 @@ def _run_power_command(args_by_os, action_label):
 
 def shutdown_computer():
     reply = prompt_user("Are you sure you want to shut down the computer? Say or type yes to confirm.") or ""
-    if "yes" not in reply.lower():
+    if reply.strip().lower() != "yes":
         speak("Okay, cancelling shutdown.")
         return
 
@@ -434,7 +436,7 @@ def cancel_shutdown():
 
 def restart_computer():
     reply = prompt_user("Are you sure you want to restart the computer? Say or type yes to confirm.") or ""
-    if "yes" not in reply.lower():
+    if reply.strip().lower() != "yes":
         speak("Okay, cancelling restart.")
         return
     _run_power_command({
@@ -447,7 +449,7 @@ def restart_computer():
 
 def sleep_computer():
     reply = prompt_user("Are you sure you want to put the computer to sleep? Say or type yes to confirm.") or ""
-    if "yes" not in reply.lower():
+    if reply.strip().lower() != "yes":
         speak("Okay, computer will stay awake.")
         return
 
@@ -541,12 +543,33 @@ SAFE_FUNCTIONS = {
     "log": math.log,
 }
 
+MAX_MATH_EXPRESSION_LENGTH = 256
+MAX_MATH_AST_NODES = 64
+MAX_MATH_ABS_VALUE = 1e100
+
+
+def _validate_math_tree(tree):
+    """Reject oversized or computationally expensive calculator expressions."""
+    nodes = list(ast.walk(tree))
+    if len(nodes) > MAX_MATH_AST_NODES:
+        raise ValueError("Expression is too complex.")
+    for node in nodes:
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
+                raise ValueError("Only numeric constants are supported.")
+            if abs(node.value) > MAX_MATH_ABS_VALUE:
+                raise ValueError("Number is too large.")
+        elif isinstance(node, ast.Call) and node.keywords:
+            raise ValueError("Keyword arguments are not supported.")
+
 
 def _eval_ast_node(node):
     if isinstance(node, ast.Expression):
         return _eval_ast_node(node.body)
     elif isinstance(node, ast.Constant):
-        if isinstance(node.value, (int, float)):
+        if not isinstance(node.value, bool) and isinstance(node.value, (int, float)):
+            if abs(node.value) > MAX_MATH_ABS_VALUE:
+                raise ValueError("Number is too large.")
             return node.value
         raise ValueError(f"Unsafe constant type: {type(node.value)}")
     elif isinstance(node, ast.BinOp):
@@ -555,6 +578,8 @@ def _eval_ast_node(node):
             raise ValueError(f"Unsupported operator: {op_type}")
         left = _eval_ast_node(node.left)
         right = _eval_ast_node(node.right)
+        if op_type is ast.Pow and (abs(right) > 100 or abs(left) > 1e10):
+            raise ValueError("Exponent is too large.")
         return SAFE_OPERATORS[op_type](left, right)
     elif isinstance(node, ast.UnaryOp):
         op_type = type(node.op)
@@ -564,8 +589,15 @@ def _eval_ast_node(node):
         return SAFE_OPERATORS[op_type](operand)
     elif isinstance(node, ast.Call):
         if isinstance(node.func, ast.Name) and node.func.id in SAFE_FUNCTIONS:
+            if node.keywords:
+                raise ValueError("Keyword arguments are not supported.")
             args = [_eval_ast_node(arg) for arg in node.args]
-            return SAFE_FUNCTIONS[node.func.id](*args)
+            if len(args) > 2:
+                raise ValueError("Too many function arguments.")
+            result = SAFE_FUNCTIONS[node.func.id](*args)
+            if isinstance(result, (int, float)) and (not math.isfinite(result) or abs(result) > MAX_MATH_ABS_VALUE):
+                raise ValueError("Result is outside the supported range.")
+            return result
         raise ValueError("Unsupported function call in math expression.")
     else:
         raise ValueError(f"Unsupported AST node: {type(node)}")
@@ -573,6 +605,9 @@ def _eval_ast_node(node):
 
 def calculate_expression(expression_str):
     """Safely calculate mathematical expression without using eval()."""
+    if not isinstance(expression_str, str) or len(expression_str) > MAX_MATH_EXPRESSION_LENGTH:
+        speak("That expression is too long to calculate safely.")
+        return
     cleaned = expression_str.lower().strip()
     for word in ("calculate", "what is", "how much is", "solve", "equals", "="):
         cleaned = cleaned.replace(word, " ")
@@ -591,7 +626,10 @@ def calculate_expression(expression_str):
 
     try:
         tree = ast.parse(cleaned, mode='eval')
+        _validate_math_tree(tree)
         result = _eval_ast_node(tree)
+        if isinstance(result, (int, float)) and (not math.isfinite(result) or abs(result) > MAX_MATH_ABS_VALUE):
+            raise ValueError("Result is outside the supported range.")
         if isinstance(result, float) and result.is_integer():
             result = int(result)
         elif isinstance(result, float):
@@ -877,11 +915,18 @@ def get_weather(city):
             speak("I didn't catch a city name.")
             return
 
+    city = str(city).strip()
+    if not city or len(city) > 100 or not re.fullmatch(r"[\w .,'-]+", city, re.UNICODE):
+        speak("Please provide a valid city name.")
+        return
+
     try:
-        geo = requests.get(
+        geo_response = requests.get(
             "https://geocoding-api.open-meteo.com/v1/search",
             params={"name": city, "count": 1}, timeout=6
-        ).json()
+        )
+        geo_response.raise_for_status()
+        geo = geo_response.json()
         results = geo.get("results")
         if not results:
             speak(f"I couldn't find a place called {city}.")
@@ -891,13 +936,15 @@ def get_weather(city):
         lat, lon = place["latitude"], place["longitude"]
         label = place.get("name", city)
 
-        forecast = requests.get(
+        forecast_response = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
                 "latitude": lat, "longitude": lon,
                 "current": "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m",
             }, timeout=6
-        ).json()
+        )
+        forecast_response.raise_for_status()
+        forecast = forecast_response.json()
 
         current = forecast.get("current", {})
         temp = current.get("temperature_2m")
@@ -996,17 +1043,31 @@ def _load_json(path, default):
         return default
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            return data if isinstance(data, type(default)) else default
     except Exception:
         return default
 
 
 def _save_json(path, data):
+    """Atomically save assistant state so interruption cannot truncate it."""
+    temp_path = None
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        fd, temp_path = tempfile.mkstemp(prefix=".jarvis-", suffix=".tmp", dir=os.path.dirname(path))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+        return True
     except Exception as err:
         print("Save JSON error:", err)
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        return False
 
 
 def parse_reminder_time(text):
@@ -1048,6 +1109,9 @@ def add_reminder(command):
         return False
 
     task = m.group(1).strip()
+    if not task or len(task) > 500:
+        speak("Reminder text must be between 1 and 500 characters.")
+        return False
     time_phrase = f"{m.group(2)} {m.group(3)}".strip()
     when = parse_reminder_time(time_phrase)
     if not when:
@@ -1056,8 +1120,13 @@ def add_reminder(command):
 
     with _reminders_lock:
         reminders = _load_json(REMINDERS_FILE, [])
+        if len(reminders) >= 1000:
+            speak("You have reached the limit of 1000 saved reminders.")
+            return False
         reminders.append({"task": task, "time": when.isoformat(), "done": False})
-        _save_json(REMINDERS_FILE, reminders)
+        if not _save_json(REMINDERS_FILE, reminders):
+            speak("I couldn't save that reminder.")
+            return False
 
     speak(f"Okay, I'll remind you to {task} at {when.strftime('%I:%M %p on %B %d').lstrip('0')}.")
     return True
@@ -1110,13 +1179,15 @@ def create_routine(command):
 
     name = m.group(1).strip().lower()
     steps = [s.strip() for s in m.group(2).strip().split(",") if s.strip()]
-    if not steps:
-        speak("I need at least one step for the routine.")
+    if not steps or len(steps) > 20 or any(len(step) > 300 for step in steps):
+        speak("A routine must have 1 to 20 steps, each no longer than 300 characters.")
         return False
 
     routines = _load_json(ROUTINES_FILE, {})
     routines[name] = steps
-    _save_json(ROUTINES_FILE, routines)
+    if not _save_json(ROUTINES_FILE, routines):
+        speak("I couldn't save that routine.")
+        return False
     speak(f"Routine '{name}' saved with {len(steps)} steps.")
     return True
 
@@ -1163,7 +1234,7 @@ def send_whatsapp_message(command):
 
     phone, message = (part.strip() for part in remainder.split(separator, 1))
     clean_phone = re.sub(r"[^\d\+]", "", phone).lstrip("+")
-    if not clean_phone or not clean_phone.isdigit() or not message:
+    if not clean_phone or not clean_phone.isdigit() or not 7 <= len(clean_phone) <= 15 or not message or len(message) > 2000:
         speak("I need a valid phone number and a message.")
         return
 
