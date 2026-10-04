@@ -173,6 +173,15 @@ class TestNotesManager(unittest.TestCase):
         self.assertFalse(os.path.exists(self.test_notes))
         self.assertTrue(os.path.exists(self.test_backup))
 
+    @patch("main.prompt_user", return_value="yesterday")
+    @patch("main.speak")
+    def test_clear_notes_requires_exact_confirmation(self, _mock_speak, _mock_prompt):
+        main.save_note("important task")
+        main.clear_notes()
+
+        self.assertTrue(os.path.exists(self.test_notes))
+        self.assertFalse(os.path.exists(self.test_backup))
+
 
 class TestSystemDiagnostics(unittest.TestCase):
     """Test that system monitoring functions execute safely without crashing."""
@@ -198,7 +207,10 @@ class TestWikipediaKnowledge(unittest.TestCase):
 
     @patch("main.speak")
     def test_wikipedia_summary(self, mock_speak):
-        res = main.ask_wikipedia("who was Isaac Newton")
+        with patch("main.wikipedia") as wikipedia_mock:
+            wikipedia_mock.search.return_value = ["Isaac Newton"]
+            wikipedia_mock.summary.return_value = "Isaac Newton was an English physicist."
+            res = main.ask_wikipedia("who was Isaac Newton")
         self.assertTrue(res)
         self.assertTrue(mock_speak.called)
         spoken_text = mock_speak.call_args[0][0]
@@ -254,6 +266,49 @@ class TestIntentMatching(unittest.TestCase):
 
         main.process_command("London weather")
         mock_weather.assert_called_with("London")
+
+
+class TestRoutines(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.original_routines_file = main.ROUTINES_FILE
+        main.ROUTINES_FILE = os.path.join(self.test_dir, "routines.json")
+        main._active_routines.clear()
+
+    def tearDown(self):
+        main.ROUTINES_FILE = self.original_routines_file
+        main._active_routines.clear()
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    @patch("main.speak")
+    def test_recursive_routine_is_stopped(self, mock_speak):
+        main._save_json(main.ROUTINES_FILE, {"loop": ["run routine loop"]})
+
+        self.assertTrue(main.run_routine("loop"))
+        mock_speak.assert_any_call("Routine 'loop' cannot run because it creates a cycle.")
+        self.assertFalse(main._active_routines)
+
+
+class TestConversationContext(unittest.TestCase):
+    @patch("client.get_openai_client")
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"})
+    def test_context_request_sends_complete_history(self, get_client):
+        completion = MagicMock()
+        completion.choices[0].message.content = "The earlier topic was astronomy."
+        client_mock = MagicMock()
+        client_mock.chat.completions.create.return_value = completion
+        get_client.return_value = client_mock
+        history = [
+            {"role": "user", "content": "Tell me about astronomy."},
+            {"role": "assistant", "content": "Astronomy studies celestial objects."},
+            {"role": "user", "content": "What was my earlier topic?"},
+        ]
+
+        response = main.ask_openai_with_context(history)
+
+        self.assertEqual(response, "The earlier topic was astronomy.")
+        request = client_mock.chat.completions.create.call_args.kwargs
+        self.assertEqual(request["messages"][1:], history)
 
 
 if __name__ == "__main__":

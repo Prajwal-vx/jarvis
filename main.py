@@ -48,7 +48,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 try:
-    from client import ask_openai, get_openai_client, is_openai_configured, load_env_file
+    from client import ask_openai, ask_openai_with_context, get_openai_client, is_openai_configured, load_env_file
     load_env_file()
 except ImportError:
     def load_env_file():
@@ -121,13 +121,6 @@ except ImportError:
             return completion.choices[0].message.content
         except Exception as err:
             return f"Sorry, I couldn't reach OpenAI: {err}"
-else:
-    def ask_openai_with_context(history):
-        """Fall back to the single-turn helper if only an external client.py is available."""
-        if not history:
-            return "I don't have anything to respond to."
-        return ask_openai(history[-1]["content"])
-
 try:
     import sounddevice as sd
 except ModuleNotFoundError:
@@ -1021,7 +1014,7 @@ def clear_notes():
         return
 
     reply = prompt_user("Are you sure you want to delete all your saved notes? Say or type yes to confirm.") or ""
-    if "yes" not in reply.lower():
+    if reply.strip().lower() != "yes":
         speak("Notes kept safe.")
         return
 
@@ -1192,6 +1185,9 @@ def create_routine(command):
     return True
 
 
+_active_routines = set()
+
+
 def run_routine(name):
     routines = _load_json(ROUTINES_FILE, {})
     name = name.strip().lower()
@@ -1200,9 +1196,17 @@ def run_routine(name):
         speak(f"I don't have a routine called {name}.")
         return False
 
-    speak(f"Running routine {name}.")
-    for step in steps:
-        process_command(step)
+    if name in _active_routines:
+        speak(f"Routine '{name}' cannot run because it creates a cycle.")
+        return False
+
+    _active_routines.add(name)
+    try:
+        speak(f"Running routine {name}.")
+        for step in steps:
+            process_command(step)
+    finally:
+        _active_routines.remove(name)
     return True
 
 

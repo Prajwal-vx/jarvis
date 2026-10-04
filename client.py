@@ -85,8 +85,27 @@ def ask_openai(prompt, system_prompt="You are a concise virtual assistant named 
         return f"Failed to get AI response: {exc}"
 
 
+def ask_openai_with_context(history, system_prompt="You are a concise virtual assistant named Jarvis. Keep answers short and conversational."):
+    """Send conversation history to OpenAI and return the latest response."""
+    if not os.getenv("OPENAI_API_KEY", "").strip():
+        raise RuntimeError("Set OPENAI_API_KEY before running the OpenAI query.")
+
+    try:
+        client = get_openai_client()
+        if client is None:
+            return "Failed to initialize the OpenAI client."
+        completion = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=[{"role": "system", "content": system_prompt}, *history],
+            timeout=15.0,
+        )
+        return completion.choices[0].message.content.strip()
+    except Exception as exc:
+        return f"Failed to get AI response: {exc}"
+
+
 if __name__ == "__main__":
     if is_openai_configured():
         print(ask_openai("what is coding"))
     else:
-        print("OPENAI_API_KEY is not set in environment or .env file.")
+        print("OPENAI_API_KEY is not set in environment or .env file.")
