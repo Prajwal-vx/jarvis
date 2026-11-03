@@ -1,0 +1,15 @@
+# Secrets
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# Local environments
+venv/
+.venv/
+vene/
+
+# Generated dependencies and Python bytecode
+node_modules/
+__pycache__/
+*.py[cod]
